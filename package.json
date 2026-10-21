@@ -1,0 +1,15 @@
+{
+  "name": "dun",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Invoice chasing that runs itself. WhatsApp-first collections with a double-entry ledger.",
+  "type": "module",
+  "bin": { "dun": "./scripts/dun.mjs" },
+  "scripts": {
+    "test": "node --test test/",
+    "cli": "node scripts/dun.mjs"
+  },
+  "dependencies": { "sql.js": "^1.15.1" },
+  "engines": { "node": ">=18.17" },
+  "license": "MIT"
+}
