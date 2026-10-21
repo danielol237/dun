@@ -12,7 +12,13 @@
 
 import { Ledger } from './ledger.mjs';
 import { planInvoice, applyPlan } from './policy.mjs';
-import { render, templateVariables, INTERNAL_TEMPLATES } from './templates.mjs';
+import {
+  render,
+  templateVariables,
+  honestTemplateKey,
+  daysLateFor,
+  INTERNAL_TEMPLATES,
+} from './templates.mjs';
 import { formatAmount } from './money.mjs';
 
 /** How many due reminders one tick will claim. */
@@ -182,7 +188,21 @@ export function claimDue(db, { now = Date.now(), limit = BATCH_SIZE } = {}) {
         formatter: formatAmount,
       });
 
-      const body = render(reminder.template_key, variables);
+      /*
+       * A step scheduled for the due date may be claimed days later, if the
+       * scheduler was down or the invoice was backdated. Sending "this is due
+       * today" to a client six days overdue is a lie, and it is the kind of
+       * lie that makes every later message less believable.
+       *
+       * So the wording follows the invoice's actual state, not the step's
+       * original intent. The step still determines *that* a message is sent and
+       * on which channel; only the sentence is corrected.
+       */
+      const daysLate = daysLateFor(reminder.due_on, now);
+      const sentTemplateKey = INTERNAL_TEMPLATES.has(reminder.template_key)
+        ? reminder.template_key
+        : honestTemplateKey(daysLate);
+      const body = render(sentTemplateKey, variables);
 
       db.run(
         "UPDATE reminder SET state = 'sending', attempted_at = ? WHERE id = ?",
@@ -192,8 +212,8 @@ export function claimDue(db, { now = Date.now(), limit = BATCH_SIZE } = {}) {
       // Internal-only templates are recorded but never addressed to a client.
       if (INTERNAL_TEMPLATES.has(reminder.template_key)) {
         db.run(
-          "UPDATE reminder SET state = 'sent', sent_at = ? WHERE id = ?",
-          [now, reminder.id],
+          "UPDATE reminder SET state = 'sent', sent_at = ?, rendered_body = ?, rendered_template_key = ? WHERE id = ?",
+          [now, body, sentTemplateKey, reminder.id],
         );
         db.run(
           `INSERT INTO audit_log (at, actor, action, entity, entity_id, detail_json)
@@ -230,6 +250,14 @@ export function claimDue(db, { now = Date.now(), limit = BATCH_SIZE } = {}) {
       db.run("UPDATE reminder SET state = 'sent', sent_at = ?, rendered_body = ? WHERE id = ?", [
         now,
         body,
+        reminder.id,
+      ]);
+
+      // The wording that was actually used, which may differ from the step's
+      // intent. Every surface that shows "last message" reads this, so the desk
+      // cannot claim a message said something it did not.
+      db.run('UPDATE reminder SET rendered_template_key = ? WHERE id = ?', [
+        sentTemplateKey,
         reminder.id,
       ]);
 

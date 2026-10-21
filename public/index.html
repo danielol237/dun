@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Dun — collections desk</title>
+<meta name="description" content="What you're owed, who owes it, and what happens next.">
+<meta name="theme-color" content="#0a0b0d">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ---------------------------------------------------------- left rail -->
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">dun</span>
+    </div>
+
+    <div class="rail-block" id="totals"></div>
+
+    <div class="rail-block">
+      <h2 class="rail-label">Queue</h2>
+      <div id="counts"></div>
+    </div>
+
+    <div class="rail-block rail-actions">
+      <button class="btn btn--primary" id="run-tick" type="button">Run the chase</button>
+      <button class="btn" id="new-invoice" type="button">New invoice</button>
+      <button class="btn" id="new-client" type="button">New client</button>
+    </div>
+
+    <div class="rail-foot">
+      <span class="health" id="health">—</span>
+      <span class="rail-time" id="clock"></span>
+    </div>
+  </aside>
+
+  <!-- --------------------------------------------------------------- board -->
+  <main class="board">
+    <header class="board-head">
+      <div>
+        <h1>What you are owed</h1>
+        <p class="board-sub" id="board-sub">loading</p>
+      </div>
+      <div class="board-filter" role="group" aria-label="Filter">
+        <button class="seg is-on" data-filter="all" type="button">All</button>
+        <button class="seg" data-filter="late" type="button">Late</button>
+        <button class="seg" data-filter="soon" type="button">Due</button>
+      </div>
+    </header>
+
+    <div id="notice" class="notice-slot" role="status" aria-live="polite"></div>
+
+    <!-- One column header for the whole book. Repeating it under every group
+         adds four stacked micro-caps lines and still tells you nothing new. -->
+    <div class="col-head" id="col-head">
+      <span>Invoice</span>
+      <span>Client</span>
+      <span>Policy</span>
+      <span>Outstanding</span>
+      <span>Age</span>
+      <span>Next</span>
+    </div>
+
+    <div id="groups"></div>
+
+    <section class="empty-state" id="empty" hidden>
+      <p class="empty-kicker">nothing outstanding</p>
+      <p class="empty-body">Every invoice is settled. The desk is clear.</p>
+    </section>
+
+    <footer class="board-foot" id="board-foot"></footer>
+  </main>
+
+  <!-- ------------------------------------------------------------ activity -->
+  <aside class="feed">
+    <header class="feed-head">
+      <h2>Outbox</h2>
+      <span class="feed-count" id="feed-count">0</span>
+    </header>
+    <div class="feed-list" id="feed"></div>
+    <p class="feed-foot">
+      Rendered and queued. Nothing sends until a channel adapter drains this.
+    </p>
+  </aside>
+
+</div>
+
+<!-- ------------------------------------------------------------------ modal -->
+<dialog class="modal" id="modal">
+  <form method="dialog" class="modal-inner" id="modal-form">
+    <header class="modal-head">
+      <h2 id="modal-title">New invoice</h2>
+      <button class="modal-x" value="cancel" type="submit" aria-label="Close">×</button>
+    </header>
+    <div class="modal-body" id="modal-body"></div>
+    <footer class="modal-foot">
+      <button class="btn" value="cancel" type="submit">Cancel</button>
+      <button class="btn btn--primary" id="modal-submit" value="ok" type="submit">Save</button>
+    </footer>
+  </form>
+</dialog>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

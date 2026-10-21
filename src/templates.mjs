@@ -1,41 +1,76 @@
 // Templates.
 //
-// Messages are data. Each template has a body per tone, and the tone comes from
-// the step, not from the template. That separation is what lets the same
-// "late" template be gentle at day 7 and firm at day 14 without duplicating
-// the copy or branching in code.
+// Messages are data. Each template declares the range of days-late it is
+// honest for, and that range is load-bearing: a step scheduled for the due date
+// can be claimed a week later if the scheduler was down, and sending "this is
+// due today" to a client who is six days overdue is worse than sending nothing.
 //
-// Every template renders from an explicit set of variables. There is no
-// arbitrary interpolation and no expression evaluation: a message can only
-// contain facts the caller passed in.
+// So the claim path picks the template whose range contains the invoice's
+// *actual* state. A message is never factually wrong about the date.
 
-/** Default template set. Overridable per policy step via `template_key`. */
+/** Default template set. */
 export const TEMPLATES = {
   heads_up: {
     label: 'Heads up before due',
+    short: 'heads up',
+    minDaysLate: -999,
+    maxDaysLate: -1,
     body: 'Hi {{client}}, quick heads-up that invoice {{number}} for {{amount}} is due {{due_date}}. No rush — just so it is on your radar.',
   },
   due_today: {
     label: 'Due today',
+    short: 'due today',
+    minDaysLate: 0,
+    maxDaysLate: 0,
     body: 'Hi {{client}}, invoice {{number}} for {{amount}} is due today. Let me know if you need the details resent.',
   },
   late_gentle: {
-    label: 'A week late',
+    label: 'Recently late',
+    short: 'nudge',
+    minDaysLate: 1,
+    maxDaysLate: 13,
     body: 'Hi {{client}}, invoice {{number}} for {{amount}} was due {{days_late}} days ago. Have you had a chance to look at it?',
   },
   late_firm: {
     label: 'Two weeks late',
+    short: 'firm chase',
+    minDaysLate: 14,
+    maxDaysLate: 29,
     body: 'Hi {{client}}, invoice {{number}} for {{amount}} is now {{days_late}} days overdue. Can you confirm when it will be settled?',
   },
   late_escalate: {
     label: 'A month late',
+    short: 'escalate',
+    minDaysLate: 30,
+    maxDaysLate: 99999,
     body: 'Hi {{client}}, invoice {{number}} for {{amount}} is {{days_late}} days overdue. I need a payment date on this one — please confirm today.',
   },
   late_flag: {
     label: 'Flagged for the owner',
+    short: 'flag owner',
+    minDaysLate: 0,
+    maxDaysLate: 99999,
     body: 'Invoice {{number}} for {{client}} ({{amount}}) is {{days_late}} days overdue. No automatic follow-up will be sent from here.',
   },
 };
+
+/**
+ * The client-facing template that honestly describes an invoice right now.
+ *
+ * @param {number} daysLate
+ * @returns {string} a template key, never `late_flag`
+ */
+export function honestTemplateKey(daysLate, templates = TEMPLATES) {
+  const clientFacing = Object.entries(templates).filter(([key]) => key !== 'late_flag');
+
+  for (const [key, template] of clientFacing) {
+    if (daysLate >= template.minDaysLate && daysLate <= template.maxDaysLate) {
+      return key;
+    }
+  }
+
+  return 'late_escalate';
+}
 
 /**
  * Render a template.
@@ -72,6 +107,11 @@ export function templateVariables({ invoice, clientName, now = Date.now(), forma
     issued_date: new Date(invoice.issued_on).toISOString().slice(0, 10),
     days_late: daysLate,
   };
+}
+
+/** How many days late an invoice is, floored at zero. */
+export function daysLateFor(dueOn, now = Date.now()) {
+  return Math.max(0, Math.floor((now - dueOn) / (24 * 60 * 60 * 1000)));
 }
 
 /** Template keys that must never be sent to a client — they are internal. */
