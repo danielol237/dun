@@ -6,6 +6,7 @@
   "type": "module",
   "bin": { "dun": "./scripts/dun.mjs" },
   "scripts": {
+    "start": "node src/server.mjs",
     "test": "node --test test/",
     "cli": "node scripts/dun.mjs"
   },

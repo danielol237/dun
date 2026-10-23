@@ -25,6 +25,7 @@ import {
   dayStart,
 } from './domain.mjs';
 import { tick, checkInvariants, onPaymentRecorded } from './scheduler.mjs';
+import * as persistence from './persistence.mjs';
 import { planInvoice, selectPolicy } from './policy.mjs';
 import { TEMPLATES } from './templates.mjs';
 
@@ -373,12 +374,50 @@ export async function createApp({ dbPath = 'data/dun.db' } = {}) {
 }
 
 export async function start({ port = Number(process.env.PORT ?? 3000), host = '0.0.0.0', dbPath } = {}) {
-  const { server, db } = await createApp({ dbPath });
+  const path = dbPath ?? 'data/dun.db';
+
+  // ── Restore before the database is opened ──
+  //
+  // Order matters. On a host with an ephemeral disk the local file is gone after
+  // every restart, so opening first would create an empty ledger and then
+  // cheerfully serve it. A configured backup that cannot be restored is a fatal
+  // startup error on purpose: an empty ledger that looks real is worse than a
+  // service that refuses to start.
+  const backupConfig = persistence.configFromEnv();
+  if (backupConfig.enabled) {
+    const restored = await persistence.restore({ config: backupConfig, dbPath: path });
+    if (restored.error) {
+      throw new Error(`could not restore the ledger: ${restored.error}`);
+    }
+    if (!restored.restored) {
+      console.log(`[backup] starting fresh — ${restored.reason}`);
+    }
+  } else {
+    console.log(`[backup] off-box copy disabled — ${backupConfig.reason}`);
+  }
+
+  const { server, db } = await createApp({ dbPath: path });
+
+  // Keep the off-box copy current. The export is a snapshot of the whole
+  // database, so it must flush first — sql.js holds the data in memory and the
+  // file on disk is only as fresh as the last write.
+  const stopBackup = persistence.startAutoBackup({
+    config: backupConfig,
+    exportBytes: async () => {
+      await db.flush();
+      return Buffer.from(db.export());
+    },
+  });
 
   await new Promise((resolve) => server.listen(port, host, resolve));
   const address = server.address();
 
-  return { server, db, port: typeof address === 'object' ? address.port : port };
+  return {
+    server,
+    db,
+    port: typeof address === 'object' ? address.port : port,
+    stopBackup,
+  };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
