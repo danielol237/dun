@@ -291,7 +291,12 @@ export function onPaymentRecorded(db, { clientId, currency, now = Date.now() } =
        JOIN invoice i ON i.id = r.invoice_id
       WHERE i.client_id = ?
         AND i.currency = ?
-        AND r.state = 'pending'
+        -- 'held' counts. A reminder held because an unallocated payment might
+        -- cover it is still an open chase: once the operator confirms the match,
+        -- the invoice is paid and that reminder has to be retired too. Leaving it
+        -- 'held' means a paid invoice still shows a paused demand, and the next
+        -- tick's reconcile can pick it back up.
+        AND r.state IN ('pending', 'held')
         AND i.amount_minor - COALESCE((SELECT SUM(a.amount_minor) FROM allocation a WHERE a.invoice_id = i.id), 0) <= 0`,
     [clientId, currency],
   );
@@ -300,7 +305,56 @@ export function onPaymentRecorded(db, { clientId, currency, now = Date.now() } =
     db.run("UPDATE reminder SET state = 'cancelled' WHERE id = ?", [reminder.id]);
   }
 
-  return { cancelled: stale.length };
+  // ── And hold anything an unallocated payment might cover ────
+  //
+  // A payment imported from a bank feed is deliberately not allocated, so the
+  // invoice still reads as outstanding and the next tick would demand money the
+  // client has already sent. That is the single most damaging thing a chaser can
+  // do, and it is not hypothetical: it is the normal path for anyone who connects
+  // a statement.
+  //
+  // 'held' is not an allocation. It does not claim the payment settles this
+  // invoice — only a person may decide that, because two invoices for the same
+  // amount make the choice arbitrary. It says: there is unexplained credit from
+  // this client that could cover this demand, so do not send it until someone has
+  // looked at the review queue.
+  //
+  // The comparison is against the client's total unallocated credit rather than
+  // this invoice alone, because one transfer can cover several invoices and the
+  // money is not earmarked.
+  const unallocated = db.value(
+    `SELECT COALESCE(SUM(pay.amount_minor - COALESCE(
+              (SELECT SUM(a.amount_minor) FROM allocation a WHERE a.payment_id = pay.id), 0)), 0)
+       FROM payment pay
+      WHERE pay.client_id = ? AND pay.currency = ?`,
+    [clientId, currency],
+  );
+
+  let held = 0;
+  if (unallocated > 0) {
+    const coverable = db.rows(
+      `SELECT r.id, i.amount_minor - COALESCE((SELECT SUM(a.amount_minor) FROM allocation a WHERE a.invoice_id = i.id), 0) AS outstanding
+         FROM reminder r
+         JOIN invoice i ON i.id = r.invoice_id
+        WHERE i.client_id = ?
+          AND i.currency = ?
+          AND i.voided_at IS NULL
+          AND r.state = 'pending'`,
+      [clientId, currency],
+    );
+
+    for (const reminder of coverable) {
+      if (reminder.outstanding <= unallocated) {
+        db.run("UPDATE reminder SET state = 'held', failure = ? WHERE id = ?", [
+          'unallocated payment could cover this — confirm the match',
+          reminder.id,
+        ]);
+        held += 1;
+      }
+    }
+  }
+
+  return { cancelled: stale.length, held };
 }
 
 /** Ledger integrity, exposed so a scheduled job can alert on it. */

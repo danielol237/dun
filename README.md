@@ -173,6 +173,27 @@ The webhook is the escape hatch. It receives
 bridge or a provider this repo has never heard of becomes a channel without
 touching the code.
 
+### Reading a bank statement
+
+```bash
+dun import statement.csv --source feed:gtbank
+dun review              # what arrived, unallocated, with proposals
+dun allocate 4 INV-0001 # confirm — the only place an allocation happens
+```
+
+Any CSV your bank exports. Columns are found by meaning, so the header order does
+not matter, and dates are read day-first. Importing the same file twice changes
+nothing — the bank's own reference is the identity.
+
+What it will not do is decide which invoice a payment settles. It proposes, with
+reasons, and waits for you. That is deliberate: two invoices for the same amount
+make an automatic choice arbitrary, and the client who paid the *other* one gets
+chased.
+
+While a payment sits unconfirmed, any reminder it could cover is **held** rather
+than sent — so connecting a statement cannot make Dun demand money that has
+already arrived.
+
 ---
 
 ## Design notes
@@ -218,6 +239,27 @@ inside a transaction, so two workers cannot both take the same row, and a proces
 that dies mid-send leaves a claim that expires rather than a row stuck forever in
 `claimed`.
 
+**A statement is read, never guessed at.** Bank exports are CSVs with the same
+facts in a different shape, so columns are found by *meaning* — "Credit Amount"
+before "Amount", because claiming the general one first flips the sign on every
+payment. Dates are read day-first, because `01/06/2026` is 1 June in the market
+this is built for; read month-first it becomes 6 January and quietly un-pays an
+invoice. A row the parser cannot read is reported with its line number, never
+coerced into a plausible number.
+
+**Nothing is allocated automatically.** This is the mistake that ruins invoicing
+tools: money arrives, find the invoice with the same amount, mark it paid. Two
+invoices for ₦450,000 make that choice arbitrary and the query decides by row
+order — so the client who paid the *other* one gets chased. The matcher proposes
+and explains; a person confirms. Confidence requires two independent kinds of
+evidence, **who** paid and **how much**; either alone is a coincidence.
+
+**An unallocated payment pauses the chase rather than stopping it.** Because an
+import deliberately leaves the payment unallocated, the invoice still reads as
+outstanding — so without this, the next tick demands money already sent. A
+reminder becomes `held`: not cancelled, because nobody has confirmed which invoice
+the money settles, but not sent either.
+
 ---
 
 ## Architecture
@@ -236,14 +278,22 @@ src/
   scheduler.mjs     reconcile → claim → outbox, plus invariants
   channels.mjs      delivery adapters: SMTP, WhatsApp Cloud API, webhook
   delivery.mjs      outbox claim, send, retry, dead-letter, health
+  statement.mjs     CSV parsing, column detection by meaning, day-first dates
+  matcher.mjs       scoring and proposals — never an allocation
+  import.mjs        statement → payments, idempotent, nothing auto-credited
 scripts/
   dun.mjs           the CLI
 test/
   money.test.mjs    11 tests
   domain.test.mjs   23 tests
   policy.test.mjs   22 tests
+  scheduler.test.mjs 24 tests
   delivery.test.mjs 14 tests
   channels.test.mjs 15 tests (real SMTP conversation, real HTTP)
+  statement.test.mjs 25 tests
+  matcher.test.mjs  14 tests
+  import.test.mjs   12 tests
+  endToEnd.test.mjs  4 tests (statement → payment → confirmed → chase stopped)
 ```
 
 The policy engine is a pure function: given a policy, an invoice and the
@@ -256,11 +306,15 @@ is why it can be tested exhaustively and replayed against old data.
 
 Honest list, because a README that implies more than exists is a liability:
 
-- **No bank feed.** Payments are entered by hand or via `dun pay`. The `source`
-  column exists for `feed:mono` / `feed:okra`, and the shape is ready, but nothing
-  is wired to a provider yet.
-- **No web interface.** The CLI covers every operation the UI would need.
+- **No live bank API.** Statements are imported from a CSV export, which every
+  Nigerian bank produces. The `source` column is already shaped for
+  `feed:mono` / `feed:okra`, and `importStatement` is the seam a poller would call
+  — but nothing is wired to a provider that streams transactions yet.
+- **No inbound message handling.** Dun sends. A client replying "I'll pay Friday"
+  is not read, and no promise is recorded. That is the next real feature.
 - **No multi-tenant.** One business per database.
+- **No hosting story.** It runs from cron on a box you control. There is no
+  Dockerfile and no managed deployment.
 
 ---
 

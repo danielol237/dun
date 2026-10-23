@@ -19,10 +19,13 @@ import {
   dayStart,
   addDays,
   findPartyByHandle,
+  allocate,
 } from '../src/domain.mjs';
 import { tick, onPaymentRecorded, checkInvariants } from '../src/scheduler.mjs';
 import { channelsFromEnv } from '../src/channels.mjs';
 import { dispatch, outboxHealth } from '../src/delivery.mjs';
+import { importStatement } from '../src/import.mjs';
+import { reviewQueue } from '../src/matcher.mjs';
 
 const DB_PATH = process.env.DUN_DB ?? 'data/dun.db';
 
@@ -340,6 +343,151 @@ const commands = {
     });
   },
 
+  /* --------------------------------------------------------------- banking */
+
+  /**
+   * Import a bank statement.
+   *
+   * Safe to run repeatedly: the bank's own reference is the identity, so
+   * re-importing yesterday's file changes nothing.
+   */
+  async import() {
+    const [file] = positional();
+    if (!file) throw new Error('usage: dun import <statement.csv> [--currency NGN] [--source feed:gtbank]');
+
+    const fs = await import('node:fs/promises');
+    let text;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch (err) {
+      throw new Error(`could not read ${file}: ${err.message}`);
+    }
+
+    const currency = flag('currency', 'NGN');
+    const source = flag('source', 'feed:manual');
+
+    await withDb(async (db) => {
+      const result = importStatement(db, text, { currency, source });
+
+      console.log(`imported ${result.imported}  duplicates ${result.duplicates}  unattributed ${result.unattributed}  debits ignored ${result.debitsIgnored}`);
+
+      if (result.rejected.length > 0) {
+        console.log(`\n${result.rejected.length} row(s) could not be read:`);
+        for (const row of result.rejected.slice(0, 10)) {
+          console.log(`  line ${row.line}: ${row.reason}`);
+        }
+      }
+
+      if (result.unattributed > 0) {
+        console.log('\nsome credits could not be attributed to a client. Add the client, then re-import — it is safe to run again.');
+      }
+
+      // The proposals are the point of the import. Printing them here is what
+      // turns a statement into a decision instead of a silent side effect.
+      // A proposal with no invoiceId is an explanation, not a match — it exists
+      // so the operator learns why nothing matched instead of assuming a bug.
+      const proposals = result.payments.filter((p) => p.proposals.length > 0 && p.proposals[0].invoiceId !== null);
+      const notes = result.payments.filter((p) => p.proposals.length > 0 && p.proposals[0].invoiceId === null);
+
+      if (proposals.length > 0) {
+        console.log('\nproposed matches (nothing is allocated until you confirm):');
+        for (const { paymentId, proposals: ranked } of proposals) {
+          const best = ranked[0];
+          const mark = best.confident ? 'likely' : 'check';
+          console.log(`  payment #${paymentId}  ${mark.padEnd(6)} ${best.number} ${best.clientName} — ${best.reasons[0]}`);
+        }
+        console.log('\nrun `dun review` to see them in full, then `dun allocate <payment> <invoice>`');
+      }
+
+      for (const { paymentId, proposals: ranked } of notes) {
+        console.log(`\npayment #${paymentId} could not be matched:`);
+        for (const reason of ranked[0].reasons) console.log(`  ! ${reason}`);
+      }
+    });
+  },
+
+  /** Money that arrived and has not been credited to an invoice. */
+  async review() {
+    await withDb(async (db) => {
+      const queue = reviewQueue(db);
+
+      if (queue.length === 0) {
+        console.log('nothing to review — every payment is allocated');
+        return;
+      }
+
+      for (const payment of queue) {
+        console.log(
+          `payment #${payment.id}  ${formatAmount(payment.unallocatedMinor, payment.currency)}  ` +
+          `${payment.client_name}  ${fmtDate(payment.received_on)}`,
+        );
+        if (payment.raw_descriptor) console.log(`  "${payment.raw_descriptor}"`);
+
+        if (payment.proposals.length === 0) {
+          console.log('  no open invoice matches — allocate manually if you know which');
+        } else if (payment.proposals[0].invoiceId === null) {
+          // An explanation rather than a proposal: there is nothing to confirm.
+          for (const reason of payment.proposals[0].reasons) console.log(`  ! ${reason}`);
+        } else {
+          for (const p of payment.proposals.slice(0, 3)) {
+            const mark = p.confident ? 'LIKELY' : '  ?   ';
+            console.log(`  ${mark} ${p.number} ${p.clientName} ${formatAmount(p.outstandingMinor, payment.currency)}  (score ${p.score})`);
+            for (const reason of p.reasons) console.log(`         · ${reason}`);
+          }
+        }
+        console.log('');
+      }
+
+      console.log('confirm with: dun allocate <payment-id> <invoice-number> [amount]');
+    });
+  },
+
+  /** Confirm a proposed match. The only place an allocation happens. */
+  async allocate() {
+    const [paymentArg, invoiceNumber, amountArg] = positional();
+    if (!paymentArg || !invoiceNumber) {
+      throw new Error('usage: dun allocate <payment-id> <invoice-number> [amount]');
+    }
+
+    await withDb(async (db) => {
+      const payment = db.row('SELECT * FROM payment WHERE id = ?', [Number(paymentArg)]);
+      if (!payment) throw new Error(`no payment #${paymentArg}`);
+
+      const invoice = db.row('SELECT * FROM invoice WHERE number = ?', [invoiceNumber]);
+      if (!invoice) throw new Error(`no invoice ${invoiceNumber}`);
+
+      const unallocated = payment.amount_minor - db.value(
+        'SELECT COALESCE(SUM(amount_minor), 0) FROM allocation WHERE payment_id = ?',
+        [payment.id],
+      );
+      if (unallocated <= 0) throw new Error(`payment #${payment.id} is already fully allocated`);
+
+      // Default to settling the invoice as far as this payment can, which is what
+      // a confirmation means in the ordinary case.
+      const outstanding = invoice.amount_minor - db.value(
+        'SELECT COALESCE(SUM(amount_minor), 0) FROM allocation WHERE invoice_id = ?',
+        [invoice.id],
+      );
+      const amountMinor = amountArg
+        ? parseAmount(amountArg, payment.currency)
+        : Math.min(unallocated, outstanding);
+
+      const result = allocate(db, payment.id, invoice.id, amountMinor);
+
+      console.log(`allocated ${formatAmount(amountMinor, payment.currency)} of payment #${payment.id} to ${invoice.number}`);
+      console.log(`invoice is now ${result.status}, ${formatAmount(result.outstandingMinor, payment.currency)} outstanding`);
+
+      // A confirmation can complete the chase.
+      if (result.outstandingMinor === 0) {
+        const cancelled = onPaymentRecorded(db, {
+          clientId: invoice.client_id,
+          currency: invoice.currency,
+        });
+        if (cancelled.cancelled > 0) console.log(`cancelled ${cancelled.cancelled} pending reminder(s)`);
+      }
+    });
+  },
+
   async plan() {
     const [invoiceNumber] = positional();
     if (!invoiceNumber) throw new Error('usage: dun plan <invoice-number>');
@@ -421,12 +569,18 @@ const commands = {
   dun pay <client> <amount> [--invoice INV-1] [--descriptor "..."]
   dun void <invoice> [--reason "..."]
   dun plan <invoice>
-  dun tick [--now 2026-10-21]
-  dun outbox
+  dun tick [--now 2026-10-21]   reconcile, plan, and deliver
+  dun send [--limit 20]         deliver what is queued
+  dun outbox                    what is queued, stuck, or dead — and why
+  dun preview <outbox-id>       the exact wording before it goes
+  dun import <statement.csv>    [--currency NGN] [--source feed:gtbank]
+  dun review                    money that arrived, unallocated, with proposals
+  dun allocate <payment> <invoice> [amount]
   dun balance
   dun check
 
-env: DUN_DB (default data/dun.db)`);
+env: DUN_DB (default data/dun.db)
+channels: SMTP_* email · WHATSAPP_* WhatsApp · CHANNEL_WEBHOOK_URL anything else`);
   },
 };
 
