@@ -138,6 +138,41 @@ Every command takes `--db`, or set `DUN_DB`. Default is `data/dun.db`.
 One tick a day is enough. The scheduler is idempotent, so a missed run or a
 double run costs nothing.
 
+### Wire up a channel, or nothing sends
+
+`tick` queues; it also sends, but only if a channel is configured. Without one it
+says so and leaves the messages queued rather than burning attempts on a
+configuration mistake.
+
+```bash
+# email — any mailbox you already pay for
+export SMTP_HOST=smtp.fastmail.com
+export SMTP_PORT=465
+export SMTP_USER=you@yourdomain.com
+export SMTP_PASS=...            # an app password, not your login
+export SMTP_FROM=you@yourdomain.com
+export SMTP_FROM_NAME="Your Studio"
+
+# whatsapp — Meta's official Cloud API
+export WHATSAPP_PHONE_NUMBER_ID=...
+export WHATSAPP_TOKEN=...
+
+# or anything else, over HTTP
+export CHANNEL_WEBHOOK_URL=https://your-bridge.example.com/send
+export CHANNEL_WEBHOOK_TOKEN=...
+```
+
+```bash
+dun outbox          # what is queued, what is stuck, and why
+dun send            # deliver now, without advancing the schedule
+dun preview 12      # see the exact wording of message #12 before it goes
+```
+
+The webhook is the escape hatch. It receives
+`{ to, body, idempotencyKey }` and any 2xx counts as delivered, so a self-hosted
+bridge or a provider this repo has never heard of becomes a channel without
+touching the code.
+
 ---
 
 ## Design notes
@@ -161,9 +196,27 @@ nothing and let a human look.
 `failed` are all states, not deletions. "Why did this client get five messages"
 has to be answerable from the data.
 
-**Messages leave through an outbox.** The scheduler renders and queues; a
-separate worker drains. That keeps the scheduling transaction short and makes
+**Messages leave through an outbox, and something actually drains it.** The
+scheduler renders and queues; `dispatch` claims and sends. That keeps the
+scheduling transaction short — no network call inside a write lock — and makes
 retries a property of the outbox rather than of every caller.
+
+**A retry is the same message, not a new one.** Every outbox row carries an
+idempotency key derived from its reminder. A send timeout is ambiguous: the
+provider may have delivered it. Without the key, the retry arrives as a second
+demand for money the client already paid. With it, a provider that supports
+de-duplication collapses the duplicate, and email carries it as a deterministic
+`Message-ID`.
+
+**A permanent failure stops.** Adapters classify their own failures: a 401 or a
+`550 no such user` will still be that in five minutes, so retrying only fills the
+log and hides the fact that nobody is being chased. A 5xx or a timeout is worth
+another attempt, with backoff that grows to a ceiling and then stops.
+
+**A crash mid-send must not strand a message.** Rows are claimed with a lease
+inside a transaction, so two workers cannot both take the same row, and a process
+that dies mid-send leaves a claim that expires rather than a row stuck forever in
+`claimed`.
 
 ---
 
@@ -181,12 +234,16 @@ src/
   policy.mjs        policy selection, step timing, planning (pure)
   templates.mjs     message templates and rendering
   scheduler.mjs     reconcile → claim → outbox, plus invariants
+  channels.mjs      delivery adapters: SMTP, WhatsApp Cloud API, webhook
+  delivery.mjs      outbox claim, send, retry, dead-letter, health
 scripts/
   dun.mjs           the CLI
 test/
   money.test.mjs    11 tests
   domain.test.mjs   23 tests
   policy.test.mjs   22 tests
+  delivery.test.mjs 14 tests
+  channels.test.mjs 15 tests (real SMTP conversation, real HTTP)
 ```
 
 The policy engine is a pure function: given a policy, an invoice and the
@@ -199,11 +256,9 @@ is why it can be tested exhaustively and replayed against old data.
 
 Honest list, because a README that implies more than exists is a liability:
 
-- **The outbox has no worker.** Messages are rendered and queued; nothing sends
-  them yet. A WhatsApp adapter is the next piece, and it belongs to wabot — this
-  repo deliberately does not depend on it.
-- **No bank feed.** Payments are entered by hand. The `source` column exists for
-  `feed:mono` / `feed:okra`, and the shape is ready, but nothing is wired.
+- **No bank feed.** Payments are entered by hand or via `dun pay`. The `source`
+  column exists for `feed:mono` / `feed:okra`, and the shape is ready, but nothing
+  is wired to a provider yet.
 - **No web interface.** The CLI covers every operation the UI would need.
 - **No multi-tenant.** One business per database.
 

@@ -21,6 +21,8 @@ import {
   findPartyByHandle,
 } from '../src/domain.mjs';
 import { tick, onPaymentRecorded, checkInvariants } from '../src/scheduler.mjs';
+import { channelsFromEnv } from '../src/channels.mjs';
+import { dispatch, outboxHealth } from '../src/delivery.mjs';
 
 const DB_PATH = process.env.DUN_DB ?? 'data/dun.db';
 
@@ -239,6 +241,102 @@ const commands = {
 
       console.log(`reconciled ${result.invoices} invoices  +${result.created} reminders  -${result.cancelled} cancelled`);
       console.log(`claimed ${result.claimed}  queued ${result.queued}  skipped ${result.skipped}`);
+
+      // Tick queues; it does not deliver. Sending is a separate pass because it
+      // leaves the database — a network call inside the reconcile transaction
+      // would hold a write lock for as long as a provider takes to answer, and a
+      // provider that never answers would block every other writer.
+      if (!flag('no-send')) {
+        const channels = channelsFromEnv();
+        const names = Object.keys(channels);
+        if (names.length === 0) {
+          console.log('no channels configured — queued messages will not send (see README: SMTP_*, WHATSAPP_*)');
+        } else {
+          const sent = await dispatch(db, { channels, now });
+          console.log(`delivered ${sent.sent}  retrying ${sent.failed}  dead ${sent.dead}  (channels: ${names.join(', ')})`);
+        }
+      }
+    });
+  },
+
+  /* -------------------------------------------------------------- delivery */
+
+  /** Send whatever is queued, without advancing the schedule. */
+  async send() {
+    await withDb(async (db) => {
+      const now = flag('now') ? Date.parse(flag('now')) : Date.now();
+      const channels = channelsFromEnv();
+      const names = Object.keys(channels);
+
+      if (names.length === 0) {
+        console.log('no channels configured. Set SMTP_* for email or WHATSAPP_* for WhatsApp, then retry.');
+        return;
+      }
+
+      const result = await dispatch(db, { channels, now, limit: Number(flag('limit', 20)) });
+
+      if (result.attempted === 0) {
+        console.log('nothing to send');
+        return;
+      }
+
+      console.log(`attempted ${result.attempted}  delivered ${result.sent}  retrying ${result.failed}  dead ${result.dead}`);
+      for (const row of result.results) {
+        const label = row.ok ? 'sent' : row.dead ? 'DEAD' : 'retry';
+        const detail = row.ok ? (row.providerId ?? '') : row.error;
+        console.log(`  #${String(row.id).padEnd(5)} ${label.padEnd(6)} ${String(detail).slice(0, 120)}`);
+      }
+    });
+  },
+
+  /** What is queued, stuck, or dead — and why. */
+  async outbox() {
+    await withDb(async (db) => {
+      const now = Date.now();
+      const health = outboxHealth(db, { now });
+
+      const states = Object.entries(health.byState);
+      if (states.length === 0) {
+        console.log('outbox is empty');
+        return;
+      }
+
+      console.log(states.map(([state, n]) => `${state} ${n}`).join('   '));
+      console.log(`due now ${health.dueNow}`);
+
+      if (health.oldestQueuedAt) {
+        const hours = Math.round(health.oldestQueuedAgeMs / 3600000);
+        console.log(`oldest queued ${hours}h ago`);
+      }
+
+      if (health.stuck.length > 0) {
+        console.log('\nstuck:');
+        for (const row of health.stuck) {
+          console.log(`  #${String(row.id).padEnd(5)} ${row.channel.padEnd(9)} ${row.recipient}  tries ${row.attempts}`);
+          if (row.last_error) console.log(`        ${String(row.last_error).slice(0, 140)}`);
+        }
+      }
+
+      const channels = Object.keys(channelsFromEnv());
+      console.log(`\nchannels: ${channels.length ? channels.join(', ') : 'none configured'}`);
+    });
+  },
+
+  /** Show the message body that would be sent, without sending it. */
+  async preview() {
+    const [id] = positional();
+    if (!id) throw new Error('usage: dun preview <outbox-id>');
+
+    await withDb(async (db) => {
+      const row = db.row('SELECT * FROM outbox_message WHERE id = ?', [Number(id)]);
+      if (!row) throw new Error(`no outbox message #${id}`);
+
+      console.log(`to       ${row.recipient}`);
+      console.log(`channel  ${row.channel}`);
+      console.log(`state    ${row.state}  attempts ${row.attempts}`);
+      if (row.idempotency_key) console.log(`key      ${row.idempotency_key}`);
+      console.log('---');
+      console.log(row.body);
     });
   },
 
