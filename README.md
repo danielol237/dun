@@ -321,3 +321,37 @@ Honest list, because a README that implies more than exists is a liability:
 ## License
 
 MIT
+
+---
+
+## Deploying
+
+The app is a single Node process with no native dependencies — `sql.js` is
+WebAssembly, so there is no build step and no toolchain. `npm ci --omit=dev`
+installs one package.
+
+```bash
+npm ci --omit=dev
+PORT=3000 DUN_DB=data/dun.db node src/server.mjs
+```
+
+A `Dockerfile` and a `render.yaml` are included. The Render blueprint is the
+shortest path to a real URL: point Render at this repo, and it reads the rest.
+
+**Set `DUN_BACKUP_REPO`, `DUN_BACKUP_TOKEN` and `DUN_BACKUP_KEY` before you trust
+it with real invoices.** Free hosts give you an ephemeral disk, so without those
+three the ledger starts empty after every restart. With them it is pulled from an
+encrypted snapshot at boot and pushed back on a timer, which makes the host's
+disk a cache rather than the only copy.
+
+The boot log says which state you are in, in one line:
+
+```
+[backup] off-box copy disabled — set DUN_BACKUP_REPO, DUN_BACKUP_TOKEN and DUN_BACKUP_KEY to keep the ledger off-box
+```
+
+or
+
+```
+[backup] restored 41984 bytes from the snapshot
+```

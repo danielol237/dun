@@ -1,0 +1,46 @@
+# One-click deploy for Render's free tier.
+#
+# Render's filesystem is ephemeral — the ledger is gone on every restart — which
+# is why DUN_BACKUP_* exists. Set the three backup variables and the database is
+# restored from the encrypted snapshot at boot and pushed back on a timer.
+#
+# Without them the app still runs; it just starts empty each time. It says so at
+# boot rather than pretending otherwise.
+services:
+  - type: web
+    name: dun
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/server.mjs
+    healthCheckPath: /api/state
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DUN_DB
+        value: data/dun.db
+      # Set these in the dashboard. They are marked sync:false so Render prompts
+      # for them instead of storing a placeholder in this file.
+      - key: DUN_BACKUP_REPO
+        sync: false
+      - key: DUN_BACKUP_TOKEN
+        sync: false
+      - key: DUN_BACKUP_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: CHANNEL_WEBHOOK_URL
+        sync: false
